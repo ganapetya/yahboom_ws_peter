@@ -1,0 +1,12 @@
+build/
+install/
+log/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.swp
+src/yahboomcar_slam/params/ORBvoc.txt
+src/yahboomcar_mediapipe/yahboomcar_mediapipe/file/shape_predictor_68_face_landmarks.dat
+src/yahboomcar_visual/detection/frozen_inference_graph.pb
