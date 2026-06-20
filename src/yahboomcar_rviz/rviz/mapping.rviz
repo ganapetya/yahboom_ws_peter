@@ -73,16 +73,16 @@ Visualization Manager:
       Name: Map
       Topic:
         Depth: 5
-        Durability Policy: Volatile
+        Durability Policy: Transient Local
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: map
+        Value: /map
       Update Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: map_updates
+        Value: /map_updates
       Use Timestamp: false
       Value: true
     - Class: rviz_default_plugins/TF
@@ -171,7 +171,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: scan
+        Value: /scan_filtered
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -234,7 +234,7 @@ Visualization Manager:
       Name: Current View
       Near Clip Distance: 0.009999999776482582
       Pitch: 1.0053977966308594
-      Target Frame: <Fixed Frame>
+      Target Frame: base_footprint
       Value: Orbit (rviz)
       Yaw: 3.435398578643799
     Saved: ~

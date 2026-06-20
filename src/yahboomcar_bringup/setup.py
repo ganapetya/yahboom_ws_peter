@@ -16,7 +16,7 @@ setup(
         #(os.path.join('share','yahboomcar_description','urdf'),glob(os.path.join('urdf','*.*'))),
 		#(os.path.join('share','yahboomcar_description','meshes'),glob(os.path.join('meshes','*.*'))),
         (os.path.join('share','yahboomcar_description','rviz'),glob(os.path.join('rviz','*.rviz*'))),
-        (os.path.join('share', package_name, 'param'), glob(os.path.join('param', '*.yaml'))),
+        (os.path.join('share', package_name, 'param'), glob(os.path.join('param', '*.*'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -39,7 +39,8 @@ setup(
         'calibrate_linear_R2 = yahboomcar_bringup.calibrate_linear_R2:main',
         'calibrate_angular_R2 = yahboomcar_bringup.calibrate_angular_R2:main',
         'patrol_4ROS_R2 = yahboomcar_bringup.patrol_4ROS_R2:main',
-        'patrol_a1_R2 = yahboomcar_bringup.patrol_a1_R2:main',   
+        'patrol_a1_R2 = yahboomcar_bringup.patrol_a1_R2:main',
+        'scan_front_filter = yahboomcar_bringup.scan_front_filter:main',
         ],
     },
 )

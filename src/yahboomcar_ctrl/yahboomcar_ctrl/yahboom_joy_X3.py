@@ -19,7 +19,9 @@ from std_msgs.msg import Int32, Bool
 class JoyTeleop(Node):
 	def __init__(self,name):
 		super().__init__(name)
-		self.Joy_active = False
+		# Default on: generic USB pads (e.g. DragonRise) often map Start to
+		# buzzer (btn 11), not enable (btn 9). Button 9 still toggles this off/on.
+		self.Joy_active = True
 		self.Buzzer_active = False
 		self.RGBLight_index = 0
 		self.cancel_time = time.time()

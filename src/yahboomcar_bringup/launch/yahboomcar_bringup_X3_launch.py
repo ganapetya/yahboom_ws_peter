@@ -3,7 +3,7 @@ from ament_index_python.packages import get_package_share_path
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import Command, LaunchConfiguration
+from launch.substitutions import Command, LaunchConfiguration, PythonExpression
 
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -73,6 +73,38 @@ def generate_launch_description():
         description='w_correction = trim * vx (rad/s per m/s).',
     )
 
+    joy_xspeed_limit_arg = DeclareLaunchArgument(
+        'joy_xspeed_limit', default_value='0.15',
+        description='Max forward/back speed from joystick (m/s). Full stick = this value.',
+    )
+    joy_yspeed_limit_arg = DeclareLaunchArgument(
+        'joy_yspeed_limit', default_value='0.15',
+        description='Max strafe speed from joystick (m/s). Full stick = this value.',
+    )
+    joy_angular_speed_limit_arg = DeclareLaunchArgument(
+        'joy_angular_speed_limit', default_value='0.5',
+        description='Max turn rate from joystick (rad/s). Full stick = this value.',
+    )
+
+    ekf_frequency_arg = DeclareLaunchArgument(
+        'ekf_frequency', default_value='10.0',
+        description='EKF output rate (Hz). Default 10 on 8 GB Jetson; use 30.0 if CPU headroom.',
+    )
+    ekf_sensor_timeout_arg = DeclareLaunchArgument(
+        'ekf_sensor_timeout', default_value='0.2',
+        description='EKF sensor timeout (s). Should be ~2× (1/ekf_frequency).',
+    )
+    use_joint_state_publisher_arg = DeclareLaunchArgument(
+        'use_joint_state_publisher', default_value='false',
+        choices=['true', 'false'],
+        description='Launch joint_state_publisher (driver already publishes /joint_states).',
+    )
+    use_ekf_arg = DeclareLaunchArgument(
+        'use_ekf', default_value='true',
+        choices=['true', 'false'],
+        description='Launch IMU filter + EKF for /odom. Set false for lightweight SLAM (wheel odom TF only).',
+    )
+
     robot_description = ParameterValue(Command(['xacro ', LaunchConfiguration('model')]),
                                        value_type=str)
 
@@ -86,7 +118,10 @@ def generate_launch_description():
     joint_state_publisher_node = Node(
         package='joint_state_publisher',
         executable='joint_state_publisher',
-        condition=UnlessCondition(LaunchConfiguration('gui'))
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration('use_joint_state_publisher'), "' == 'true' and '",
+            LaunchConfiguration('gui'), "' == 'false'"
+        ])),
     )
 
     joint_state_publisher_gui_node = Node(
@@ -134,19 +169,41 @@ def generate_launch_description():
     imu_filter_node = Node(
         package='imu_filter_madgwick',
         executable='imu_filter_madgwick_node',
+        condition=IfCondition(LaunchConfiguration('use_ekf')),
         parameters=[imu_filter_config]
     )
 
-    ekf_node = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([os.path.join(
-            get_package_share_directory('robot_localization'), 'launch'),
-            '/ekf_x1_x3_launch.py'])
+    ekf_params = os.path.join(
+        get_package_share_directory('robot_localization'),
+        'params', 'ekf_x1_x3.yaml')
+
+    ekf_node = Node(
+        package='robot_localization',
+        executable='ekf_node',
+        name='ekf_filter_node',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_ekf')),
+        parameters=[
+            ekf_params,
+            {
+                'frequency': ParameterValue(
+                    LaunchConfiguration('ekf_frequency'), value_type=float),
+                'sensor_timeout': ParameterValue(
+                    LaunchConfiguration('ekf_sensor_timeout'), value_type=float),
+            },
+        ],
+        remappings=[('/odometry/filtered', '/odom')],
     )
 
     yahboom_joy_node = Node(
         package='yahboomcar_ctrl',
         executable='yahboom_joy_X3',
         condition=IfCondition(LaunchConfiguration('use_joystick')),
+        parameters=[{
+            'xspeed_limit': ParameterValue(LaunchConfiguration('joy_xspeed_limit'), value_type=float),
+            'yspeed_limit': ParameterValue(LaunchConfiguration('joy_yspeed_limit'), value_type=float),
+            'angular_speed_limit': ParameterValue(LaunchConfiguration('joy_angular_speed_limit'), value_type=float),
+        }],
     )
     joy_node = Node(
         package='joy',
@@ -164,6 +221,13 @@ def generate_launch_description():
         use_joystick_arg,
         trim_vy_per_vx_arg,
         trim_w_per_vx_arg,
+        joy_xspeed_limit_arg,
+        joy_yspeed_limit_arg,
+        joy_angular_speed_limit_arg,
+        ekf_frequency_arg,
+        ekf_sensor_timeout_arg,
+        use_joint_state_publisher_arg,
+        use_ekf_arg,
         joint_state_publisher_node,
         joint_state_publisher_gui_node,
         robot_state_publisher_node,
