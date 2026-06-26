@@ -24,20 +24,20 @@
     </participant>
     <data_writer profile_name="mapping_writer" is_default_profile="true">
         <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
-        <qos>
-            <history>
+        <topic>
+            <historyQos>
                 <kind>KEEP_LAST</kind>
                 <depth>5</depth>
-            </history>
-        </qos>
+            </historyQos>
+        </topic>
     </data_writer>
     <data_reader profile_name="mapping_reader" is_default_profile="true">
         <historyMemoryPolicy>PREALLOCATED_WITH_REALLOC</historyMemoryPolicy>
-        <qos>
-            <history>
+        <topic>
+            <historyQos>
                 <kind>KEEP_LAST</kind>
                 <depth>5</depth>
-            </history>
-        </qos>
+            </historyQos>
+        </topic>
     </data_reader>
 </profiles>

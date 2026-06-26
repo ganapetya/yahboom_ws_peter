@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Drop laser ranges outside a trusted forward arc (default ±90°).
+"""Keep a trusted angular arc of the laser scan; clear everything else.
 
-The X3 stack mounts the RPLidar low on the chassis; upper structure blocks
-the rear hemisphere. Feeding those hits to SLAM creates phantom walls and a
-chaotic map. This node publishes /scan_filtered with rear ranges cleared.
+The arc is defined by a center bearing and a half-width (radians). A range whose
+bearing is within +/- half-width of the center is kept; all others are set to +inf.
+
+X3 NOTE: the RPLiDAR A1 is mounted ~180 deg rotated relative to the URDF, so in the
+RAW scan frame angle 0 points to the robot's REAR (the antennas/wires) and angle
++/-pi points to the robot's FRONT. To trust the clean front, launch with
+trusted_center = pi (see myscripts2/t2.5.sh). The companion URDF fix adds 180 deg
+yaw to base_link->laser_link so the kept points are placed in the correct direction.
 """
 
 import math
@@ -26,19 +31,21 @@ class ScanFrontFilter(Node):
         super().__init__('scan_front_filter')
         self.declare_parameter('input_topic', '/scan')
         self.declare_parameter('output_topic', '/scan_filtered')
-        self.declare_parameter('trusted_angle_min', -math.pi / 2.0)
-        self.declare_parameter('trusted_angle_max', math.pi / 2.0)
+        # Bearing (rad) the trusted arc is centered on, and its half-width (rad).
+        # Default: center 0 (forward), half-width 90 deg. Override per robot.
+        self.declare_parameter('trusted_center', 0.0)
+        self.declare_parameter('trusted_halfwidth', math.pi / 2.0)
 
         input_topic = self.get_parameter('input_topic').value
         output_topic = self.get_parameter('output_topic').value
-        self.trusted_min = float(self.get_parameter('trusted_angle_min').value)
-        self.trusted_max = float(self.get_parameter('trusted_angle_max').value)
+        self.center = float(self.get_parameter('trusted_center').value)
+        self.halfwidth = abs(float(self.get_parameter('trusted_halfwidth').value))
 
         self.pub = self.create_publisher(LaserScan, output_topic, 10)
         self.sub = self.create_subscription(LaserScan, input_topic, self.callback, 10)
         self.get_logger().info(
-            f'Keeping scan angles [{math.degrees(self.trusted_min):.0f}, '
-            f'{math.degrees(self.trusted_max):.0f}] deg -> {output_topic}'
+            f'Trusting arc center={math.degrees(self.center):.0f} deg '
+            f'+/-{math.degrees(self.halfwidth):.0f} deg -> {output_topic}'
         )
 
     def callback(self, msg: LaserScan) -> None:
@@ -55,8 +62,8 @@ class ScanFrontFilter(Node):
         out.intensities = list(msg.intensities)
 
         for i, _ in enumerate(out.ranges):
-            angle = _normalize_angle(msg.angle_min + i * msg.angle_increment)
-            if angle < self.trusted_min or angle > self.trusted_max:
+            angle = msg.angle_min + i * msg.angle_increment
+            if abs(_normalize_angle(angle - self.center)) > self.halfwidth:
                 out.ranges[i] = float('inf')
                 if i < len(out.intensities):
                     out.intensities[i] = 0.0
