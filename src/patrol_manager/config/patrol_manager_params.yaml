@@ -1,0 +1,35 @@
+patrol_manager:
+  ros__parameters:
+    # --- Scheduling ---
+    start_on_boot: true
+    loop_patrol: false   # FIRST-RUN: one cycle then idle. Set true for unattended looping.
+    patrol_period_sec: 1800.0
+
+    # --- Navigation action ---
+    navigate_action_name: "navigate_to_pose"
+    nav_goal_timeout_sec: 180.0
+    settle_after_arrival_sec: 1.0
+
+    # --- Topics ---
+    image_topic: "/camera/color/image_raw"
+    mail_request_topic: "/cat_patrol/mail_request"
+    state_topic: "/patrol_manager/state"
+
+    # --- Capture + mail ---
+    image_save_dir: "/tmp/cat_patrol_images"
+    mail_subject: "Cat patrol photos"
+    smtp_to_address: "peter.botnet@gmail.com"
+
+    # --- Frame assumptions ---
+    map_frame: "map"
+
+    # --- Home pose in map frame (x, y, yaw radians) ---
+    # Captured by driving 2026-07-09 (new map).
+    home_pose: [0.331, -0.086, 0.043]
+
+    # --- Waypoints in map frame ---
+    # Captured live by driving on 2026-07-09. Keep all 4 arrays same length.
+    waypoint_names: ["wp1", "wp2", "wp3", "wp4", "wp5", "wp6", "wp7", "wp8", "wp9", "wp10"]
+    waypoint_x:   [1.585,  3.151,  5.133,  6.402,  6.478,  3.644,  3.183,  2.987,  3.344,  1.954]
+    waypoint_y:   [-0.120, -0.511, -0.672, -0.476, -1.132, -0.392,  1.502,  2.178,  0.709, -0.277]
+    waypoint_yaw: [-0.115, -0.272,  0.135,  0.150,  2.904,  3.036,  1.855,  2.992, -1.312, -2.966]
