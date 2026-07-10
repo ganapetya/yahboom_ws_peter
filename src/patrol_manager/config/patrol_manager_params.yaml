@@ -15,6 +15,18 @@ patrol_manager:
     mail_request_topic: "/cat_patrol/mail_request"
     state_topic: "/patrol_manager/state"
 
+    # --- Stall guard (2026-07-10) ---
+    # Compares commanded velocity against actual wheel-encoder velocity (/vel_raw,
+    # published by Mcnamu_driver_X3). If we're commanding real motion but the wheels
+    # aren't actually turning for stall_timeout_sec, cancel the goal, stop, and email
+    # an alert instead of letting Nav2 grind against something it can't see (e.g. a
+    # backup-style blind reverse, or a low object under the lidar's scan plane).
+    cmd_vel_topic: "/cmd_vel"
+    vel_raw_topic: "/vel_raw"
+    stall_timeout_sec: 6.0
+    stall_cmd_vel_threshold: 0.03
+    stall_vel_raw_threshold: 0.02
+
     # --- Capture + mail ---
     image_save_dir: "/tmp/cat_patrol_images"
     mail_subject: "Cat patrol photos"

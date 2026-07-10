@@ -14,6 +14,7 @@ find_package(nav2_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
 
 include_directories(include)
@@ -24,7 +25,7 @@ ament_target_dependencies(waypoint_patrol_strategy rclcpp)
 add_executable(patrol_manager_node src/patrol_manager_node.cpp)
 target_link_libraries(patrol_manager_node waypoint_patrol_strategy ${OpenCV_LIBS})
 ament_target_dependencies(patrol_manager_node
-  rclcpp rclcpp_action nav2_msgs geometry_msgs sensor_msgs std_msgs
+  rclcpp rclcpp_action nav2_msgs geometry_msgs sensor_msgs std_msgs visualization_msgs
 )
 
 install(TARGETS

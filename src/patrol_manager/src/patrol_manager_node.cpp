@@ -2,6 +2,7 @@
 #include <cmath>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -9,11 +10,14 @@
 #include <opencv2/opencv.hpp>
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "visualization_msgs/msg/marker.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 
 #include "patrol_manager/waypoint_patrol_strategy.hpp"
 
@@ -54,6 +58,17 @@ public:
     mail_to_ = declare_parameter<std::string>("smtp_to_address", "user@example.com");
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
 
+    // Stall guard: compares commanded velocity (cmd_vel_topic) against actual
+    // wheel-encoder velocity (vel_raw_topic). Nav2's own progress checker only
+    // watches position over ~10-20s; this catches a robot that is commanded to
+    // move but physically can't (jammed against an unseen obstacle) faster,
+    // and works no matter which Nav2 state (goal, recovery) is commanding it.
+    cmd_vel_topic_ = declare_parameter<std::string>("cmd_vel_topic", "/cmd_vel");
+    vel_raw_topic_ = declare_parameter<std::string>("vel_raw_topic", "/vel_raw");
+    stall_timeout_sec_ = declare_parameter<double>("stall_timeout_sec", 6.0);
+    stall_cmd_vel_threshold_ = declare_parameter<double>("stall_cmd_vel_threshold", 0.03);
+    stall_vel_raw_threshold_ = declare_parameter<double>("stall_vel_raw_threshold", 0.02);
+
     const auto home_pose = declare_parameter<std::vector<double>>("home_pose", std::vector<double>{0.0, 0.0, 0.0});
     if (home_pose.size() == 3) {
       home_.x = home_pose[0];
@@ -75,6 +90,14 @@ public:
     for (std::size_t i = 0; i < names.size(); ++i) {
       waypoints.push_back(Pose2D{xs[i], ys[i], yaws[i], names[i]});
     }
+
+    // Latched (transient_local) so RViz sees the markers even if added after
+    // this node started. Published once here from the same data the FSM
+    // navigates to, so what you see in RViz is guaranteed to match reality.
+    waypoints_marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/patrol_manager/waypoints", rclcpp::QoS(1).transient_local());
+    publish_waypoint_markers(waypoints);
+
     strategy_ = std::make_unique<WaypointPatrolStrategy>(std::move(waypoints));
 
     std::filesystem::create_directories(image_save_dir_);
@@ -89,6 +112,15 @@ public:
     image_sub_ = create_subscription<sensor_msgs::msg::Image>(
       image_topic_, rclcpp::SensorDataQoS(),
       [this](sensor_msgs::msg::Image::SharedPtr msg) { last_image_ = msg; },
+      sub_opts);
+
+    cmd_vel_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+      cmd_vel_topic_, rclcpp::SystemDefaultsQoS(),
+      [this](geometry_msgs::msg::Twist::SharedPtr msg) { last_cmd_vel_ = msg; },
+      sub_opts);
+    vel_raw_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+      vel_raw_topic_, rclcpp::SystemDefaultsQoS(),
+      [this](geometry_msgs::msg::Twist::SharedPtr msg) { last_vel_raw_ = msg; },
       sub_opts);
 
     mail_pub_ = create_publisher<std_msgs::msg::String>(mail_request_topic_, 10);
@@ -127,8 +159,61 @@ private:
     return out;
   }
 
+  void publish_waypoint_markers(const std::vector<Pose2D> & waypoints)
+  {
+    visualization_msgs::msg::MarkerArray markers;
+    const auto stamp = now();
+    int id = 0;
+
+    auto add_pose = [&](const Pose2D & p, float r, float g, float b) {
+      visualization_msgs::msg::Marker arrow;
+      arrow.header.frame_id = map_frame_;
+      arrow.header.stamp = stamp;
+      arrow.ns = "patrol_waypoints";
+      arrow.id = id++;
+      arrow.type = visualization_msgs::msg::Marker::ARROW;
+      arrow.action = visualization_msgs::msg::Marker::ADD;
+      arrow.pose = to_pose(p, map_frame_, stamp).pose;
+      arrow.scale.x = 0.35;  // shaft length
+      arrow.scale.y = 0.06;  // shaft diameter
+      arrow.scale.z = 0.06;  // head diameter
+      arrow.color.r = r;
+      arrow.color.g = g;
+      arrow.color.b = b;
+      arrow.color.a = 1.0;
+      markers.markers.push_back(arrow);
+
+      visualization_msgs::msg::Marker label;
+      label.header = arrow.header;
+      label.ns = "patrol_waypoint_labels";
+      label.id = id++;
+      label.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+      label.action = visualization_msgs::msg::Marker::ADD;
+      label.pose = arrow.pose;
+      label.pose.position.z += 0.25;
+      label.scale.z = 0.18;  // text height
+      label.color.r = r;
+      label.color.g = g;
+      label.color.b = b;
+      label.color.a = 1.0;
+      label.text = p.name;
+      markers.markers.push_back(label);
+    };
+
+    for (const auto & wp : waypoints) {
+      add_pose(wp, 0.1f, 0.6f, 1.0f);  // blue: patrol waypoints
+    }
+    add_pose(home_, 1.0f, 0.1f, 0.1f);  // red: home
+
+    waypoints_marker_pub_->publish(markers);
+    RCLCPP_INFO(get_logger(), "Published %zu waypoint markers to /patrol_manager/waypoints (frame=%s)",
+                waypoints.size() + 1, map_frame_.c_str());
+  }
+
   void tick()
   {
+    check_stall();
+
     switch (state_) {
       case State::SLEEPING:
         if (wake_requested_) {
@@ -156,6 +241,7 @@ private:
 
       case State::CAPTURE:
         if (save_current_image()) {
+          send_waypoint_mail(current_waypoint_.name, cycle_image_paths_.back());
           if (strategy_->has_next()) {
             send_next_waypoint_goal();
           } else {
@@ -184,6 +270,7 @@ private:
     }
 
     const auto wp = strategy_->next();
+    current_waypoint_ = wp;
     auto goal = NavigateToPose::Goal();
     goal.pose = to_pose(wp, map_frame_, now());
 
@@ -192,6 +279,8 @@ private:
                 wp.name.c_str(), wp.x, wp.y, wp.yaw);
 
     auto opts = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
+    opts.goal_response_callback =
+      [this](GoalHandle::SharedPtr handle) { this->active_goal_handle_ = handle; };
     opts.feedback_callback =
       [this](GoalHandle::SharedPtr,
              const std::shared_ptr<const NavigateToPose::Feedback> fb) {
@@ -200,12 +289,18 @@ private:
       };
 
     opts.result_callback =
-      [this](const GoalHandle::WrappedResult & result) {
+      [this, wp](const GoalHandle::WrappedResult & result) {
+        this->active_goal_handle_.reset();
+        if (this->state_ == State::SLEEPING) {
+          return;  // stall guard already cancelled and stopped the cycle
+        }
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
           this->transition(State::CAPTURE);
         } else {
-          RCLCPP_ERROR(this->get_logger(), "Waypoint goal failed (code=%d)", static_cast<int>(result.code));
-          this->transition(State::SLEEPING);
+          RCLCPP_ERROR(this->get_logger(),
+            "Waypoint '%s' goal failed (code=%d); skipping it and continuing cycle",
+            wp.name.c_str(), static_cast<int>(result.code));
+          this->send_next_waypoint_goal();
         }
       };
 
@@ -220,10 +315,17 @@ private:
     RCLCPP_INFO(get_logger(), "Returning home x=%.2f y=%.2f yaw=%.2f", home_.x, home_.y, home_.yaw);
 
     auto opts = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
+    opts.goal_response_callback =
+      [this](GoalHandle::SharedPtr handle) { this->active_goal_handle_ = handle; };
     opts.result_callback =
       [this](const GoalHandle::WrappedResult & result) {
+        this->active_goal_handle_.reset();
+        if (this->state_ == State::SLEEPING) {
+          return;  // stall guard already cancelled and stopped the cycle
+        }
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
-          send_mail_request();
+          RCLCPP_INFO(get_logger(), "Cycle complete: %zu photo(s) sent, returned home",
+                      cycle_image_paths_.size());
           transition(State::SLEEPING);
           if (!loop_patrol_) {
             RCLCPP_INFO(get_logger(), "loop_patrol=false, cycle complete");
@@ -283,22 +385,74 @@ private:
     return false;
   }
 
-  void send_mail_request()
+  void check_stall()
+  {
+    if (state_ != State::PATROLLING && state_ != State::RETURNING) {
+      stall_since_.reset();
+      return;
+    }
+    if (!last_cmd_vel_ || !last_vel_raw_) {
+      return;  // no data yet
+    }
+
+    const double cmd_speed = std::hypot(last_cmd_vel_->linear.x, last_cmd_vel_->linear.y) +
+      std::abs(last_cmd_vel_->angular.z);
+    const double actual_speed = std::hypot(last_vel_raw_->linear.x, last_vel_raw_->linear.y) +
+      std::abs(last_vel_raw_->angular.z);
+
+    const bool commanding_motion = cmd_speed > stall_cmd_vel_threshold_;
+    const bool actually_moving = actual_speed > stall_vel_raw_threshold_;
+
+    if (!commanding_motion || actually_moving) {
+      stall_since_.reset();
+      return;
+    }
+
+    if (!stall_since_) {
+      stall_since_ = now();
+    } else if ((now() - *stall_since_).seconds() > stall_timeout_sec_) {
+      handle_stall_detected();
+      stall_since_.reset();
+    }
+  }
+
+  void handle_stall_detected()
+  {
+    RCLCPP_ERROR(get_logger(),
+      "STALL DETECTED near '%s': commanding motion but /vel_raw shows no movement "
+      "for %.1fs; cancelling goal and stopping", current_waypoint_.name.c_str(), stall_timeout_sec_);
+    if (active_goal_handle_) {
+      action_client_->async_cancel_goal(active_goal_handle_);
+      active_goal_handle_.reset();
+    }
+    send_stall_alert();
+    transition(State::SLEEPING);
+  }
+
+  void send_stall_alert()
   {
     std::ostringstream oss;
-    oss << "{\"subject\":\"" << mail_subject_ << "\",";
+    oss << "{\"subject\":\"" << mail_subject_ << " - STALL near " << current_waypoint_.name << "\",";
     oss << "\"to\":\"" << mail_to_ << "\",";
-    oss << "\"paths\":[";
-    for (size_t i = 0; i < cycle_image_paths_.size(); ++i) {
-      if (i > 0) {oss << ",";}
-      oss << "\"" << cycle_image_paths_[i] << "\"";
-    }
-    oss << "]}";
+    oss << "\"paths\":[]}";
 
     std_msgs::msg::String msg;
     msg.data = oss.str();
     mail_pub_->publish(msg);
-    RCLCPP_INFO(get_logger(), "Published mail request with %zu images", cycle_image_paths_.size());
+    RCLCPP_WARN(get_logger(), "Published stall alert mail");
+  }
+
+  void send_waypoint_mail(const std::string & waypoint_name, const std::string & image_path)
+  {
+    std::ostringstream oss;
+    oss << "{\"subject\":\"" << mail_subject_ << " - " << waypoint_name << "\",";
+    oss << "\"to\":\"" << mail_to_ << "\",";
+    oss << "\"paths\":[\"" << image_path << "\"]}";
+
+    std_msgs::msg::String msg;
+    msg.data = oss.str();
+    mail_pub_->publish(msg);
+    RCLCPP_INFO(get_logger(), "Published mail request for waypoint '%s'", waypoint_name.c_str());
   }
 
   void transition(State s)
@@ -334,12 +488,20 @@ private:
   std::string mail_subject_;
   std::string mail_to_;
   std::string map_frame_;
+  std::string cmd_vel_topic_;
+  std::string vel_raw_topic_;
+  double stall_timeout_sec_{6.0};
+  double stall_cmd_vel_threshold_{0.03};
+  double stall_vel_raw_threshold_{0.02};
 
   // State
   State state_{State::SLEEPING};
   bool wake_requested_{false};
   Pose2D home_;
+  Pose2D current_waypoint_;
   std::vector<std::string> cycle_image_paths_;
+  std::optional<rclcpp::Time> stall_since_;
+  GoalHandle::SharedPtr active_goal_handle_;
 
   // Concurrency
   rclcpp::CallbackGroup::SharedPtr fsm_group_;
@@ -349,8 +511,13 @@ private:
   rclcpp::TimerBase::SharedPtr fsm_timer_;
   rclcpp::TimerBase::SharedPtr wake_timer_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr vel_raw_sub_;
+  geometry_msgs::msg::Twist::SharedPtr last_cmd_vel_;
+  geometry_msgs::msg::Twist::SharedPtr last_vel_raw_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mail_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr waypoints_marker_pub_;
   sensor_msgs::msg::Image::SharedPtr last_image_;
   rclcpp_action::Client<NavigateToPose>::SharedPtr action_client_;
 
