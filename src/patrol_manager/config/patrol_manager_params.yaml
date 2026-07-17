@@ -2,8 +2,9 @@ patrol_manager:
   ros__parameters:
     # --- Scheduling ---
     start_on_boot: true
-    loop_patrol: false   # FIRST-RUN: one cycle then idle. Set true for unattended looping.
+    loop_patrol: true    # repeat cycles back-to-back (paused patrol_pause_sec between) until the node is stopped
     patrol_period_sec: 1800.0
+    patrol_pause_sec: 10.0
 
     # --- Navigation action ---
     navigate_action_name: "navigate_to_pose"

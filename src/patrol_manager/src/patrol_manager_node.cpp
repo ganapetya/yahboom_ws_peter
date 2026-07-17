@@ -48,6 +48,7 @@ public:
     start_on_boot_ = declare_parameter<bool>("start_on_boot", true);
     loop_patrol_ = declare_parameter<bool>("loop_patrol", true);
     patrol_period_sec_ = declare_parameter<double>("patrol_period_sec", 1800.0);
+    patrol_pause_sec_ = declare_parameter<double>("patrol_pause_sec", 10.0);
     settle_after_arrival_sec_ = declare_parameter<double>("settle_after_arrival_sec", 1.0);
 
     image_topic_ = declare_parameter<std::string>("image_topic", "/camera/color/image_raw");
@@ -327,7 +328,10 @@ private:
           RCLCPP_INFO(get_logger(), "Cycle complete: %zu photo(s) sent, returned home",
                       cycle_image_paths_.size());
           transition(State::SLEEPING);
-          if (!loop_patrol_) {
+          if (loop_patrol_) {
+            RCLCPP_INFO(get_logger(), "loop_patrol=true, next cycle in %.0fs", patrol_pause_sec_);
+            schedule_next_cycle();
+          } else {
             RCLCPP_INFO(get_logger(), "loop_patrol=false, cycle complete");
           }
         } else {
@@ -337,6 +341,19 @@ private:
       };
 
     action_client_->async_send_goal(goal, opts);
+  }
+
+  void schedule_next_cycle()
+  {
+    // One-shot: cancel itself on first fire so cycles don't stack if the node
+    // stays up a long time between wakes.
+    pause_timer_ = create_wall_timer(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(patrol_pause_sec_)),
+      [this]() {
+        wake_requested_ = true;
+        pause_timer_->cancel();
+      },
+      fsm_group_);
   }
 
   bool save_current_image()
@@ -480,6 +497,7 @@ private:
   bool start_on_boot_{true};
   bool loop_patrol_{true};
   double patrol_period_sec_{1800.0};
+  double patrol_pause_sec_{10.0};
   double settle_after_arrival_sec_{1.0};
   std::string image_topic_;
   std::string mail_request_topic_;
@@ -510,6 +528,7 @@ private:
   // ROS entities
   rclcpp::TimerBase::SharedPtr fsm_timer_;
   rclcpp::TimerBase::SharedPtr wake_timer_;
+  rclcpp::TimerBase::SharedPtr pause_timer_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr vel_raw_sub_;
