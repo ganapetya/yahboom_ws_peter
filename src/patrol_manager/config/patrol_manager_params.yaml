@@ -29,7 +29,9 @@ patrol_manager:
     stall_vel_raw_threshold: 0.02
 
     # --- Capture + mail ---
-    image_save_dir: "/tmp/cat_patrol_images"
+    # Was /tmp/cat_patrol_images -- /tmp is wiped on reboot. Moved to a
+    # persistent dir (Phase 5 revision) so waypoint photos survive restarts.
+    image_save_dir: "/home/jetson/cat_patrol_data/captures"
     mail_subject: "Cat patrol photos"
     smtp_to_address: "peter.botnet@gmail.com"
 

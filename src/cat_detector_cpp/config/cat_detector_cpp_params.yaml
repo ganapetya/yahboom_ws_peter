@@ -1,0 +1,36 @@
+cat_detector_cpp:
+  ros__parameters:
+    # --- Model ---
+    model_path: "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_detector_cpp/models/yolov8n.onnx"
+    use_cuda: true
+    imgsz: 640
+
+    # --- Class filtering ---
+    # COCO 'cat' == class 15.
+    target_classes: [15]
+    conf_threshold: 0.45
+    iou_threshold: 0.50
+
+    # --- Topics ---
+    # Distinct from cat_detector's (Python) topics/dir so both can run
+    # side-by-side for an FPS comparison without colliding. Only run one
+    # against the real robot at a time -- both would beep off the same
+    # physical /Buzzer.
+    image_topic: "/camera/color/image_raw"
+    detections_topic: "/cat_detector_cpp/detections"
+    annotated_topic: "/cat_detector_cpp/image_annotated"
+    publish_annotated: true
+    log_fps_every_sec: 5.0
+    tick_period_ms: 5
+
+    # --- Persistent dataset capture on sighting (Phase 5b flywheel) ---
+    save_on_detection: true
+    detection_image_dir: "/home/jetson/cat_patrol_data/detections_cpp"
+    sighting_gap_sec: 3.0
+    detection_save_interval_sec: 5.0
+    max_detection_images: 500
+
+    # --- Beep on sighting ---
+    beep_on_detection: true
+    beep_topic: "Buzzer"
+    beep_duration_sec: 0.15

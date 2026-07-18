@@ -1,0 +1,39 @@
+cat_detector:
+  ros__parameters:
+    # --- Model ---
+    model_path: "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_detector/models/yolov8n.pt"
+    # After TensorRT export, point this at the .engine instead:
+    # model_path: ".../models/yolov8n.engine"
+    device: "cuda:0"
+    imgsz: 640
+
+    # --- Class filtering ---
+    # COCO 'cat' == class 15. For the 5b two-cat model, switch to the
+    # custom class ids and names of the fine-tuned weights.
+    target_classes: [15]
+    conf_threshold: 0.45
+    iou_threshold: 0.50
+
+    # --- Topics ---
+    image_topic: "/camera/color/image_raw"
+    detections_topic: "/cat_detector/detections"
+    annotated_topic: "/cat_detector/image_annotated"
+
+    # --- Throughput / drop-stale ---
+    publish_annotated: true
+    log_fps_every_sec: 5.0
+
+    # --- Persistent dataset capture on sighting (Phase 5b flywheel) ---
+    save_on_detection: true
+    detection_image_dir: "/home/jetson/cat_patrol_data/detections"
+    sighting_gap_sec: 3.0             # no-detection gap after which the next
+                                       # detection counts as a NEW sighting
+    detection_save_interval_sec: 5.0  # while one sighting continues, save
+                                       # another frame at most this often
+    max_detection_images: 500         # retention cap; oldest deleted past this
+
+    # --- Beep on sighting ---
+    beep_on_detection: true
+    beep_topic: "Buzzer"               # same topic Mcnamu_driver_X3.py already
+                                        # subscribes to for the real buzzer
+    beep_duration_sec: 0.15
