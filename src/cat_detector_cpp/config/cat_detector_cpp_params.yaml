@@ -34,3 +34,10 @@ cat_detector_cpp:
     beep_on_detection: true
     beep_topic: "Buzzer"
     beep_duration_sec: 0.15
+
+    # --- Per-cat identification (Phase 5b) ---
+    enable_identification: true
+    classifier_model_path: "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_detector_cpp/models/cat_id_classifier.onnx"
+    # Must match the class index order printed by export_classifier_onnx.py
+    # (alphabetical, same as train_classifier.py's CLASSES).
+    classifier_classes: ["brown", "white"]

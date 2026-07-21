@@ -1,0 +1,21 @@
+{
+  "classes": [
+    "brown",
+    "white"
+  ],
+  "test_acc": 0.8181818181818182,
+  "confusion": [
+    [
+      5,
+      2
+    ],
+    [
+      0,
+      4
+    ]
+  ],
+  "class_counts": {
+    "brown": 28,
+    "white": 46
+  }
+}

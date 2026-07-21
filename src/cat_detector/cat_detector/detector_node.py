@@ -13,10 +13,20 @@ import cv2
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from PIL import Image as PILImage
+
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 from vision_msgs.msg import Detection2DArray, Detection2D, \
     ObjectHypothesisWithPose, BoundingBox2D
+
+# Padding fraction must match collect_dataset.py's PAD_FRAC (0.15) -- the
+# classifier was trained on crops padded this much, so live crops need the
+# same context around the box or accuracy silently degrades.
+ID_CROP_PAD_FRAC = 0.15
 
 
 class CatDetector(Node):
@@ -56,6 +66,18 @@ class CatDetector(Node):
             self.create_publisher(Bool, beep_topic, 10) if self.beep_on_detection else None
         )
 
+        # --- Per-cat identification (Phase 5b) ---
+        self.enable_identification = bool(
+            self.declare_parameter("enable_identification", True).value)
+        self.classifier_model_path = self.declare_parameter(
+            "classifier_model_path",
+            "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_detector/models/cat_id_classifier.pt"
+        ).value
+        self.classifier = None
+        self.classifier_classes = None
+        if self.enable_identification:
+            self._load_classifier()
+
         self.get_logger().info(f"Loading model {self.model_path} on {self.device}")
         self.model = YOLO(self.model_path)
         self.bridge = CvBridge()
@@ -79,6 +101,63 @@ class CatDetector(Node):
             f"cat_detector started. image_topic={image_topic} "
             f"detections_topic={det_topic} detection_image_dir={self.detection_image_dir}")
 
+    def _load_classifier(self):
+        if not os.path.isfile(self.classifier_model_path):
+            self.get_logger().warning(
+                f"enable_identification=true but no classifier at "
+                f"{self.classifier_model_path} -- falling back to generic "
+                f"'cat' detection only (run train_classifier.py first).")
+            self.enable_identification = False
+            return
+
+        checkpoint = torch.load(self.classifier_model_path, map_location=self.device)
+        self.classifier_classes = checkpoint["classes"]
+
+        net = models.mobilenet_v2(weights=None)
+        in_features = net.classifier[1].in_features
+        net.classifier[1] = nn.Linear(in_features, len(self.classifier_classes))
+        net.load_state_dict(checkpoint["model_state_dict"])
+        net.eval()
+        self.classifier = net.to(self.device)
+
+        self.classifier_tf = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        self.get_logger().info(
+            f"Loaded per-cat classifier from {self.classifier_model_path} "
+            f"(classes={self.classifier_classes}, test_acc="
+            f"{checkpoint.get('test_acc', 'unknown')})")
+
+    def _classify_crop(self, frame_bgr, box):
+        """Crop the detection box (padded to match training, ID_CROP_PAD_FRAC)
+        out of the BGR frame and run the per-cat classifier on it. Returns
+        (label, confidence) or (None, None) if identification is disabled."""
+        if not self.enable_identification or self.classifier is None:
+            return None, None
+
+        h, w = frame_bgr.shape[:2]
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        px, py = bw * ID_CROP_PAD_FRAC, bh * ID_CROP_PAD_FRAC
+        cx1 = max(0, int(x1 - px))
+        cy1 = max(0, int(y1 - py))
+        cx2 = min(w, int(x2 + px))
+        cy2 = min(h, int(y2 + py))
+        crop = frame_bgr[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            return None, None
+
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        pil_img = PILImage.fromarray(rgb)
+        tensor = self.classifier_tf(pil_img).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            probs = torch.softmax(self.classifier(tensor), dim=1)[0]
+        idx = int(probs.argmax())
+        return self.classifier_classes[idx], float(probs[idx])
+
     def _on_image(self, msg):
         self._latest = msg  # overwrite -> latest-wins
 
@@ -96,6 +175,7 @@ class CatDetector(Node):
 
         out = Detection2DArray()
         out.header = msg.header
+        identities = []  # (label, conf) or (None, None) per box, for annotation
         for b in r.boxes:
             cls_id = int(b.cls[0])
             score = float(b.conf[0])
@@ -112,14 +192,30 @@ class CatDetector(Node):
             hyp.hypothesis.class_id = str(cls_id)
             hyp.hypothesis.score = score
             d.results.append(hyp)
+
+            label, id_conf = self._classify_crop(frame, (x1, y1, x2, y2))
+            if label is not None:
+                id_hyp = ObjectHypothesisWithPose()
+                id_hyp.hypothesis.class_id = label
+                id_hyp.hypothesis.score = id_conf
+                d.results.append(id_hyp)
+            identities.append((label, id_conf))
+
             out.detections.append(d)
         self.det_pub.publish(out)
 
         if out.detections:
-            self._handle_sighting(frame)
+            self._handle_sighting(frame, identities)
 
         if self.ann_pub is not None:
             annotated = r.plot()  # BGR np.ndarray with boxes drawn
+            for (label, id_conf), b in zip(identities, r.boxes):
+                if label is None:
+                    continue
+                x1, y1 = b.xyxy[0][:2].tolist()
+                text = f"{label} {id_conf:.2f}"
+                cv2.putText(annotated, text, (int(x1), max(0, int(y1) - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             ann_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
             ann_msg.header = msg.header
             self.ann_pub.publish(ann_msg)
@@ -132,7 +228,7 @@ class CatDetector(Node):
             self._frames = 0
             self._t0 = now
 
-    def _handle_sighting(self, frame):
+    def _handle_sighting(self, frame, identities=None):
         """Called once per frame that contains >=1 cat detection.
 
         Beeps once per NEW sighting (a gap of sighting_gap_sec with no cat
@@ -149,18 +245,25 @@ class CatDetector(Node):
         )
         self._last_seen_time = now
 
+        label = None
+        if identities:
+            named = [(l, c) for l, c in identities if l is not None]
+            if named:
+                label = max(named, key=lambda lc: lc[1])[0]
+
         if is_new_sighting:
-            self.get_logger().info("Cat sighting started")
+            self.get_logger().info(
+                f"Cat sighting started" + (f" ({label})" if label else ""))
             if self.beep_on_detection:
                 self._beep()
             if self.save_on_detection:
-                self._save_frame(frame)
+                self._save_frame(frame, label)
                 self._last_saved_time = now
         elif self.save_on_detection and (
             self._last_saved_time is None
             or (now - self._last_saved_time) >= self.detection_save_interval_sec
         ):
-            self._save_frame(frame)
+            self._save_frame(frame, label)
             self._last_saved_time = now
 
     def _beep(self):
@@ -178,9 +281,12 @@ class CatDetector(Node):
         off.data = False
         self.beep_pub.publish(off)
 
-    def _save_frame(self, frame):
+    def _save_frame(self, frame, label=None):
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        fp = os.path.join(self.detection_image_dir, f"cat_{ts}.jpg")
+        # Label suffix comes after the timestamp so cat_*.jpg sorting/eviction
+        # in _enforce_retention (chronological via plain name sort) still works.
+        name = f"cat_{ts}_{label}.jpg" if label else f"cat_{ts}.jpg"
+        fp = os.path.join(self.detection_image_dir, name)
         if cv2.imwrite(fp, frame):
             self.get_logger().info(f"Saved detection frame: {fp}")
             self._enforce_retention()

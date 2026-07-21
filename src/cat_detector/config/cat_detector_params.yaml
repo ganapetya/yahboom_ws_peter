@@ -37,3 +37,7 @@ cat_detector:
     beep_topic: "Buzzer"               # same topic Mcnamu_driver_X3.py already
                                         # subscribes to for the real buzzer
     beep_duration_sec: 0.15
+
+    # --- Per-cat identification (Phase 5b) ---
+    enable_identification: true
+    classifier_model_path: "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_detector/models/cat_id_classifier.pt"

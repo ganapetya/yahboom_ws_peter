@@ -30,6 +30,14 @@ namespace cat_detector_cpp
 // No objectness score (unlike v5) -- columns 4.. are per-class scores directly.
 constexpr int kBoxCols = 4;
 
+// Must match collect_dataset.py's PAD_FRAC / the Python detector_node.py's
+// ID_CROP_PAD_FRAC -- the classifier was trained on crops padded this much
+// around the YOLO box, so live crops need the same padding or accuracy
+// silently degrades.
+constexpr double kIdCropPadFrac = 0.15;
+constexpr int kIdResizeShortSide = 256;  // matches transforms.Resize(256)
+constexpr int kIdCropSize = 224;          // matches transforms.CenterCrop(224)
+
 class DetectorNode : public rclcpp::Node
 {
 public:
@@ -70,6 +78,14 @@ public:
     const auto beep_topic = declare_parameter<std::string>("beep_topic", "Buzzer");
     beep_duration_sec_ = declare_parameter<double>("beep_duration_sec", 0.15);
 
+    // --- Per-cat identification (Phase 5b) ---
+    enable_identification_ = declare_parameter<bool>("enable_identification", true);
+    classifier_model_path_ = declare_parameter<std::string>(
+      "classifier_model_path",
+      "/home/jetson/yahboomcar_ros2_ws/yahboomcar_ws/src/cat_detector_cpp/models/cat_id_classifier.onnx");
+    classifier_classes_ = declare_parameter<std::vector<std::string>>(
+      "classifier_classes", std::vector<std::string>{"brown", "white"});
+
     RCLCPP_INFO(get_logger(), "Loading ONNX model %s (use_cuda=%d)",
                 model_path_.c_str(), use_cuda_);
     net_ = cv::dnn::readNetFromONNX(model_path_);
@@ -79,6 +95,27 @@ public:
     } else {
       net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
       net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    }
+
+    if (enable_identification_) {
+      if (!std::filesystem::exists(classifier_model_path_)) {
+        RCLCPP_WARN(get_logger(),
+          "enable_identification=true but no classifier at %s -- falling "
+          "back to generic 'cat' detection only (run export_classifier_onnx.py first).",
+          classifier_model_path_.c_str());
+        enable_identification_ = false;
+      } else {
+        RCLCPP_INFO(get_logger(), "Loading classifier %s (classes: %zu)",
+                    classifier_model_path_.c_str(), classifier_classes_.size());
+        classifier_net_ = cv::dnn::readNetFromONNX(classifier_model_path_);
+        if (use_cuda_) {
+          classifier_net_.setPreferableBackend(cv::dnn::DNN_BACKEND_CUDA);
+          classifier_net_.setPreferableTarget(cv::dnn::DNN_TARGET_CUDA);
+        } else {
+          classifier_net_.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+          classifier_net_.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        }
+      }
     }
 
     det_pub_ = create_publisher<vision_msgs::msg::Detection2DArray>(detections_topic_, 10);
@@ -173,9 +210,18 @@ private:
 
     const auto detections = infer(frame);
 
+    // Parallel to `detections`: per-box (label, confidence) from the
+    // per-cat classifier, or ("", -1) if identification didn't fire.
+    std::vector<std::pair<std::string, float>> identities;
+    identities.reserve(detections.size());
+    for (const auto & d : detections) {
+      identities.push_back(classify_crop(frame, cv::Rect(d.x, d.y, d.w, d.h)));
+    }
+
     vision_msgs::msg::Detection2DArray out;
     out.header = msg->header;
-    for (const auto & d : detections) {
+    for (size_t i = 0; i < detections.size(); ++i) {
+      const auto & d = detections[i];
       vision_msgs::msg::Detection2D det;
       det.header = msg->header;
       det.bbox.center.position.x = d.x + d.w / 2.0;
@@ -186,20 +232,35 @@ private:
       hyp.hypothesis.class_id = std::to_string(d.class_id);
       hyp.hypothesis.score = d.score;
       det.results.push_back(hyp);
+
+      const auto & [id_label, id_conf] = identities[i];
+      if (!id_label.empty()) {
+        vision_msgs::msg::ObjectHypothesisWithPose id_hyp;
+        id_hyp.hypothesis.class_id = id_label;
+        id_hyp.hypothesis.score = id_conf;
+        det.results.push_back(id_hyp);
+      }
+
       out.detections.push_back(det);
     }
     det_pub_->publish(out);
 
     if (!out.detections.empty()) {
-      handle_sighting(frame);
+      handle_sighting(frame, identities);
     }
 
     if (publish_annotated_) {
       cv::Mat annotated = frame.clone();
-      for (const auto & d : detections) {
+      for (size_t i = 0; i < detections.size(); ++i) {
+        const auto & d = detections[i];
         cv::rectangle(annotated, cv::Rect(d.x, d.y, d.w, d.h), cv::Scalar(0, 255, 0), 2);
         std::ostringstream label;
-        label << "cat " << static_cast<int>(d.score * 100) << "%";
+        const auto & [id_label, id_conf] = identities[i];
+        if (!id_label.empty()) {
+          label << id_label << " " << static_cast<int>(id_conf * 100) << "%";
+        } else {
+          label << "cat " << static_cast<int>(d.score * 100) << "%";
+        }
         cv::putText(annotated, label.str(), cv::Point(d.x, std::max(0, d.y - 5)),
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 1);
       }
@@ -222,6 +283,102 @@ private:
     int class_id;
     float score;
   };
+
+  // Crop the detection box out of the full frame, padded by kIdCropPadFrac
+  // (matching the training-time crop padding), clamped to the frame bounds.
+  static cv::Mat crop_for_identification(const cv::Mat & frame, const cv::Rect & box)
+  {
+    const int w = frame.cols;
+    const int h = frame.rows;
+    const double px = box.width * kIdCropPadFrac;
+    const double py = box.height * kIdCropPadFrac;
+    const int x1 = std::max(0, static_cast<int>(box.x - px));
+    const int y1 = std::max(0, static_cast<int>(box.y - py));
+    const int x2 = std::min(w, static_cast<int>(box.x + box.width + px));
+    const int y2 = std::min(h, static_cast<int>(box.y + box.height + py));
+    if (x2 <= x1 || y2 <= y1) {
+      return cv::Mat();
+    }
+    return frame(cv::Rect(x1, y1, x2 - x1, y2 - y1)).clone();
+  }
+
+  // Reproduces train_classifier.py's eval-time preprocessing
+  // (Resize(256) + CenterCrop(224) + ToTensor + ImageNet Normalize) using
+  // plain OpenCV ops rather than cv::dnn::blobFromImage's built-in mean/scale,
+  // because blobFromImage only supports a single uniform scalefactor across
+  // channels and ImageNet normalization needs a different scale factor
+  // (1/std) per channel. INTER_AREA is used for the downscale specifically
+  // because it was verified (bench comparison against the PyTorch/PIL
+  // reference) to track PIL's antialiased Resize much more closely than
+  // INTER_LINEAR -- the two backends are never bit-exact, but this keeps
+  // predicted-class agreement on every example tried.
+  static cv::Mat preprocess_for_classifier(const cv::Mat & bgr_crop)
+  {
+    const int h = bgr_crop.rows;
+    const int w = bgr_crop.cols;
+    const double scale = kIdResizeShortSide / static_cast<double>(std::min(h, w));
+    const int new_w = static_cast<int>(std::round(w * scale));
+    const int new_h = static_cast<int>(std::round(h * scale));
+
+    cv::Mat resized;
+    cv::resize(bgr_crop, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_AREA);
+
+    const int x0 = std::clamp((new_w - kIdCropSize) / 2, 0, std::max(0, new_w - kIdCropSize));
+    const int y0 = std::clamp((new_h - kIdCropSize) / 2, 0, std::max(0, new_h - kIdCropSize));
+    cv::Mat cropped = resized(cv::Rect(x0, y0, kIdCropSize, kIdCropSize));
+
+    cv::Mat rgb;
+    cv::cvtColor(cropped, rgb, cv::COLOR_BGR2RGB);
+    cv::Mat float_img;
+    rgb.convertTo(float_img, CV_32FC3, 1.0 / 255.0);
+
+    static const cv::Scalar kMean(0.485, 0.456, 0.406);
+    static const cv::Scalar kStd(0.229, 0.224, 0.225);
+    std::vector<cv::Mat> channels(3);
+    cv::split(float_img, channels);
+    for (int c = 0; c < 3; ++c) {
+      channels[c] = (channels[c] - kMean[c]) / kStd[c];
+    }
+    cv::Mat normalized;
+    cv::merge(channels, normalized);
+
+    // Already normalized -> blobFromImage just does HWC->CHW + batch dim.
+    return cv::dnn::blobFromImage(normalized);
+  }
+
+  // Returns (label, confidence), or ("", -1) if identification is disabled,
+  // the classifier isn't loaded, or the padded box crops to nothing.
+  std::pair<std::string, float> classify_crop(const cv::Mat & frame, const cv::Rect & box)
+  {
+    if (!enable_identification_) {
+      return {"", -1.0f};
+    }
+    cv::Mat crop = crop_for_identification(frame, box);
+    if (crop.empty()) {
+      return {"", -1.0f};
+    }
+
+    cv::Mat blob = preprocess_for_classifier(crop);
+    classifier_net_.setInput(blob);
+    cv::Mat output = classifier_net_.forward();  // (1, num_classes) raw logits
+
+    cv::Mat flat = output.reshape(1, 1);
+    double max_logit;
+    cv::minMaxLoc(flat, nullptr, &max_logit);
+    cv::Mat exp_scores;
+    cv::exp(flat - max_logit, exp_scores);
+    const double sum = cv::sum(exp_scores)[0];
+    exp_scores /= sum;  // softmax
+
+    cv::Point max_loc;
+    double max_prob;
+    cv::minMaxLoc(exp_scores, nullptr, &max_prob, nullptr, &max_loc);
+    const int idx = max_loc.x;
+    if (idx < 0 || idx >= static_cast<int>(classifier_classes_.size())) {
+      return {"", -1.0f};
+    }
+    return {classifier_classes_[idx], static_cast<float>(max_prob)};
+  }
 
   std::vector<Detection> infer(const cv::Mat & frame)
   {
@@ -296,7 +453,9 @@ private:
   // "new"), and saves a timestamped frame for the Phase 5b dataset --
   // immediately on a new sighting, then throttled to at most one more every
   // detection_save_interval_sec_ while it continues.
-  void handle_sighting(const cv::Mat & frame)
+  void handle_sighting(
+    const cv::Mat & frame,
+    const std::vector<std::pair<std::string, float>> & identities)
   {
     const auto t_now = std::chrono::steady_clock::now();
     const bool is_new_sighting =
@@ -304,13 +463,25 @@ private:
       std::chrono::duration<double>(t_now - *last_seen_time_).count() > sighting_gap_sec_;
     last_seen_time_ = t_now;
 
+    // Best identified label across all boxes in this frame (highest
+    // classifier confidence), matching detector_node.py's approach.
+    std::string label;
+    float best_conf = -1.0f;
+    for (const auto & [id_label, id_conf] : identities) {
+      if (!id_label.empty() && id_conf > best_conf) {
+        label = id_label;
+        best_conf = id_conf;
+      }
+    }
+
     if (is_new_sighting) {
-      RCLCPP_INFO(get_logger(), "Cat sighting started");
+      RCLCPP_INFO(get_logger(), "Cat sighting started%s",
+                  label.empty() ? "" : (" (" + label + ")").c_str());
       if (beep_on_detection_) {
         beep();
       }
       if (save_on_detection_) {
-        save_frame(frame);
+        save_frame(frame, label);
         last_saved_time_ = t_now;
       }
     } else if (save_on_detection_ &&
@@ -318,7 +489,7 @@ private:
        std::chrono::duration<double>(t_now - *last_saved_time_).count() >=
          detection_save_interval_sec_))
     {
-      save_frame(frame);
+      save_frame(frame, label);
       last_saved_time_ = t_now;
     }
   }
@@ -342,7 +513,7 @@ private:
     }
   }
 
-  void save_frame(const cv::Mat & frame)
+  void save_frame(const cv::Mat & frame, const std::string & label = "")
   {
     const auto t = std::chrono::system_clock::now();
     const auto t_sec = std::chrono::system_clock::to_time_t(t);
@@ -355,7 +526,12 @@ private:
     ts << std::put_time(&tm_buf, "%Y%m%d_%H%M%S") << "_"
        << std::setw(3) << std::setfill('0') << ms.count();
 
-    const auto fp = (std::filesystem::path(detection_image_dir_) / ("cat_" + ts.str() + ".jpg")).string();
+    // Label suffix comes after the timestamp so cat_*.jpg sorting/eviction
+    // in enforce_retention (chronological via plain path sort) still works.
+    const std::string filename = label.empty()
+      ? "cat_" + ts.str() + ".jpg"
+      : "cat_" + ts.str() + "_" + label + ".jpg";
+    const auto fp = (std::filesystem::path(detection_image_dir_) / filename).string();
     if (cv::imwrite(fp, frame)) {
       RCLCPP_INFO(get_logger(), "Saved detection frame: %s", fp.c_str());
       enforce_retention();
@@ -408,6 +584,10 @@ private:
   bool beep_on_detection_{true};
   double beep_duration_sec_{0.15};
 
+  bool enable_identification_{true};
+  std::string classifier_model_path_;
+  std::vector<std::string> classifier_classes_;
+
   // --- State ---
   sensor_msgs::msg::Image::SharedPtr latest_msg_;
   std::optional<std::chrono::steady_clock::time_point> last_seen_time_;
@@ -419,6 +599,7 @@ private:
 
   // --- ROS entities ---
   cv::dnn::Net net_;
+  cv::dnn::Net classifier_net_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
   rclcpp::Publisher<vision_msgs::msg::Detection2DArray>::SharedPtr det_pub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr ann_pub_;
