@@ -31,7 +31,9 @@ cat_detector_cpp:
     max_detection_images: 500
 
     # --- Beep on sighting ---
-    beep_on_detection: true
+    # Off by default: cat_voice.launch.py's voice_node plays a per-cat mp3
+    # line on recognition instead of the onboard buzzer.
+    beep_on_detection: false
     beep_topic: "Buzzer"
     beep_duration_sec: 0.15
 

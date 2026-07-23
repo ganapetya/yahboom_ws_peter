@@ -9,9 +9,13 @@ classifier head fine-tuned -- appropriate for a dataset this small (dozens,
 not thousands, of images per class) where fine-tuning the whole network
 would just overfit.
 
-Augmentation is deliberately mild and, crucially, has NO hue/saturation
-jitter: color is the actual signal distinguishing the two cats, so
-randomizing it would train the model to ignore the one feature that matters.
+Augmentation is mild, but DOES include hue/saturation jitter: the "brown"
+cat is not a solid color, it's a gray/black/brown mix, so its average color
+shifts with exposure/white-balance and can drift into "white" territory in
+bright light (see phase5-status.md -- all observed test errors were
+brown->white, none the other way). Hue/saturation jitter forces the model
+to be robust to that lighting-driven color drift instead of keying on an
+exact hue that only holds for some lighting conditions.
 
 Split: group-aware so near-duplicate frames from the same sighting (the
 robot saves one frame every few seconds while a cat lingers, per
@@ -160,7 +164,7 @@ def main():
         transforms.RandomResizedCrop(224, scale=(0.75, 1.0)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),  # no hue/saturation on purpose
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.3, hue=0.05),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
