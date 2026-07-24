@@ -5,6 +5,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <opencv2/opencv.hpp>
@@ -16,6 +17,7 @@
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "vision_msgs/msg/detection2_d_array.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 
@@ -58,6 +60,18 @@ public:
     mail_subject_ = declare_parameter<std::string>("mail_subject", "Cat patrol photos");
     mail_to_ = declare_parameter<std::string>("smtp_to_address", "user@example.com");
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
+
+    // --- Cat-recognized snapshot email (fires only during an active cycle) ---
+    // cat_detector_cpp publishes a Detection2DArray with the white/brown identity
+    // in results[1]; detections_cb() emails a snapshot on a confident sighting.
+    detections_topic_ = declare_parameter<std::string>(
+      "detections_topic", "/cat_detector_cpp/detections");
+    cat_recognized_mail_enabled_ = declare_parameter<bool>("cat_recognized_mail_enabled", true);
+    cat_recognized_min_conf_ = declare_parameter<double>("cat_recognized_min_conf", 0.6);
+    cat_recognized_cooldown_sec_ =
+      declare_parameter<double>("cat_recognized_cooldown_sec", 30.0);
+    // --- Loop-boundary snapshot emails (start of WAKING, end at home) ---
+    loop_boundary_mail_enabled_ = declare_parameter<bool>("loop_boundary_mail_enabled", true);
 
     // Stall guard: compares commanded velocity (cmd_vel_topic) against actual
     // wheel-encoder velocity (vel_raw_topic). Nav2's own progress checker only
@@ -123,6 +137,19 @@ public:
       vel_raw_topic_, rclcpp::SystemDefaultsQoS(),
       [this](geometry_msgs::msg::Twist::SharedPtr msg) { last_vel_raw_ = msg; },
       sub_opts);
+
+    // Cat identity stream from cat_detector_cpp. Placed on the MutuallyExclusive
+    // fsm_group_ (not io_group_) so detections_cb() is serialized with tick() and
+    // the action result callbacks — it reads state_ and writes last_cat_mail_, and
+    // must not race the FSM under the MultiThreadedExecutor.
+    if (cat_recognized_mail_enabled_) {
+      rclcpp::SubscriptionOptions det_opts;
+      det_opts.callback_group = fsm_group_;
+      detections_sub_ = create_subscription<vision_msgs::msg::Detection2DArray>(
+        detections_topic_, 10,
+        std::bind(&PatrolManagerNode::detections_cb, this, std::placeholders::_1),
+        det_opts);
+    }
 
     mail_pub_ = create_publisher<std_msgs::msg::String>(mail_request_topic_, 10);
     state_pub_ = create_publisher<std_msgs::msg::String>(state_topic_, 10);
@@ -233,6 +260,15 @@ private:
             "navigate_to_pose action server unavailable; staying in WAKING");
           break;
         }
+        // Loop START email: one snapshot as a new cycle begins. We only reach
+        // here (server ready) once per cycle before leaving WAKING for
+        // PATROLLING, so this fires exactly once per loop.
+        if (loop_boundary_mail_enabled_) {
+          const std::string p = save_snapshot("loopstart");
+          if (!p.empty()) {
+            send_mail(mail_subject_ + " - patrol loop started", {p});
+          }
+        }
         send_next_waypoint_goal();
         break;
 
@@ -327,6 +363,13 @@ private:
         if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
           RCLCPP_INFO(get_logger(), "Cycle complete: %zu photo(s) sent, returned home",
                       cycle_image_paths_.size());
+          // Loop END email: one snapshot now that we're back home.
+          if (loop_boundary_mail_enabled_) {
+            const std::string p = save_snapshot("loopend");
+            if (!p.empty()) {
+              send_mail(mail_subject_ + " - patrol loop ended", {p});
+            }
+          }
           transition(State::SLEEPING);
           if (loop_patrol_) {
             RCLCPP_INFO(get_logger(), "loop_patrol=true, next cycle in %.0fs", patrol_pause_sec_);
@@ -356,16 +399,15 @@ private:
       fsm_group_);
   }
 
-  bool save_current_image()
+  // Manual sensor_msgs::Image -> BGR cv::Mat conversion (same approach as
+  // patrol_node.cpp). Avoids a cv_bridge dependency/ABI risk on this build.
+  bool decode_last_image(cv::Mat & out)
   {
     if (!last_image_ || last_image_->data.empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "No image available yet");
       return false;
     }
-
     try {
-      // Manual sensor_msgs::Image -> cv::Mat conversion (same approach as
-      // patrol_node.cpp). Avoids a cv_bridge dependency/ABI risk on this build.
       const std::string & enc = last_image_->encoding;
       const int rows = static_cast<int>(last_image_->height);
       const int cols = static_cast<int>(last_image_->width);
@@ -388,18 +430,102 @@ private:
       if (bgr_image.empty()) {
         return false;
       }
-      std::ostringstream fn;
-      fn << "snap_" << now().nanoseconds() << ".jpg";
-      const auto fp = (std::filesystem::path(image_save_dir_) / fn.str()).string();
-      if (cv::imwrite(fp, bgr_image)) {
-        cycle_image_paths_.push_back(fp);
-        RCLCPP_INFO(get_logger(), "Captured: %s", fp.c_str());
-        return true;
-      }
+      out = bgr_image;
+      return true;
     } catch (const std::exception & e) {
-      RCLCPP_WARN(get_logger(), "save_current_image exception: %s", e.what());
+      RCLCPP_WARN(get_logger(), "decode_last_image exception: %s", e.what());
+      return false;
+    }
+  }
+
+  // Save the current frame as a standalone "<tag>_<ts>.jpg" and return its
+  // path (or "" on failure). Does NOT touch cycle_image_paths_ — used for the
+  // loop-boundary and cat-recognized emails, which must not inflate the
+  // per-cycle capture count reported on return home.
+  std::string save_snapshot(const std::string & tag)
+  {
+    cv::Mat bgr_image;
+    if (!decode_last_image(bgr_image)) {
+      return "";
+    }
+    std::ostringstream fn;
+    fn << tag << "_" << now().nanoseconds() << ".jpg";
+    const auto fp = (std::filesystem::path(image_save_dir_) / fn.str()).string();
+    if (cv::imwrite(fp, bgr_image)) {
+      RCLCPP_INFO(get_logger(), "Snapshot: %s", fp.c_str());
+      return fp;
+    }
+    RCLCPP_WARN(get_logger(), "save_snapshot: imwrite failed for %s", fp.c_str());
+    return "";
+  }
+
+  // Save the current frame as a waypoint capture: appends to cycle_image_paths_
+  // (the per-cycle batch) as before.
+  bool save_current_image()
+  {
+    cv::Mat bgr_image;
+    if (!decode_last_image(bgr_image)) {
+      return false;
+    }
+    std::ostringstream fn;
+    fn << "snap_" << now().nanoseconds() << ".jpg";
+    const auto fp = (std::filesystem::path(image_save_dir_) / fn.str()).string();
+    if (cv::imwrite(fp, bgr_image)) {
+      cycle_image_paths_.push_back(fp);
+      RCLCPP_INFO(get_logger(), "Captured: %s", fp.c_str());
+      return true;
     }
     return false;
+  }
+
+  // True whenever a patrol cycle is running (anything but SLEEPING). Gates the
+  // cat-recognized email so it never fires while parked at home between cycles.
+  bool is_patrolling() const { return state_ != State::SLEEPING; }
+
+  // Emails one snapshot when cat_detector_cpp recognizes a white/brown cat
+  // mid-cycle. Mirrors voice_node.py's identity logic (results[1]); highest-
+  // confidence identity in the frame, gated by min-conf and a per-cat cooldown.
+  void detections_cb(const vision_msgs::msg::Detection2DArray::SharedPtr msg)
+  {
+    if (!cat_recognized_mail_enabled_ || !is_patrolling()) {
+      return;
+    }
+
+    std::string best_label;
+    double best_conf = -1.0;
+    for (const auto & det : msg->detections) {
+      if (det.results.size() < 2) {
+        continue;  // per-cat classifier didn't fire for this box
+      }
+      const auto & id_hyp = det.results[1].hypothesis;
+      if ((id_hyp.class_id == "white" || id_hyp.class_id == "brown") &&
+          id_hyp.score > best_conf)
+      {
+        best_label = id_hyp.class_id;
+        best_conf = id_hyp.score;
+      }
+    }
+
+    if (best_label.empty() || best_conf < cat_recognized_min_conf_) {
+      return;
+    }
+
+    const rclcpp::Time tnow = now();
+    const auto it = last_cat_mail_.find(best_label);
+    if (it != last_cat_mail_.end() &&
+        (tnow - it->second).seconds() < cat_recognized_cooldown_sec_)
+    {
+      return;
+    }
+
+    const std::string path = save_snapshot("cat_" + best_label);
+    if (path.empty()) {
+      return;  // no frame yet; try again on the next detection
+    }
+    last_cat_mail_[best_label] = tnow;
+    RCLCPP_INFO(get_logger(), "Recognized %s cat (%.2f) - emailing snapshot",
+                best_label.c_str(), best_conf);
+    send_mail(mail_subject_ + " - " + best_label + " cat recognized", {path});
   }
 
   void check_stall()
@@ -446,30 +572,38 @@ private:
     transition(State::SLEEPING);
   }
 
-  void send_stall_alert()
+  // Build and publish a JSON mail request for the Python mail_node. Single
+  // choke point for every email this node sends (waypoint, stall, loop
+  // boundary, cat recognized).
+  void send_mail(const std::string & subject, const std::vector<std::string> & paths)
   {
     std::ostringstream oss;
-    oss << "{\"subject\":\"" << mail_subject_ << " - STALL near " << current_waypoint_.name << "\",";
+    oss << "{\"subject\":\"" << subject << "\",";
     oss << "\"to\":\"" << mail_to_ << "\",";
-    oss << "\"paths\":[]}";
+    oss << "\"paths\":[";
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+      if (i > 0) {
+        oss << ",";
+      }
+      oss << "\"" << paths[i] << "\"";
+    }
+    oss << "]}";
 
     std_msgs::msg::String msg;
     msg.data = oss.str();
     mail_pub_->publish(msg);
-    RCLCPP_WARN(get_logger(), "Published stall alert mail");
+    RCLCPP_INFO(get_logger(), "Published mail request \"%s\" (%zu attachments)",
+                subject.c_str(), paths.size());
+  }
+
+  void send_stall_alert()
+  {
+    send_mail(mail_subject_ + " - STALL near " + current_waypoint_.name, {});
   }
 
   void send_waypoint_mail(const std::string & waypoint_name, const std::string & image_path)
   {
-    std::ostringstream oss;
-    oss << "{\"subject\":\"" << mail_subject_ << " - " << waypoint_name << "\",";
-    oss << "\"to\":\"" << mail_to_ << "\",";
-    oss << "\"paths\":[\"" << image_path << "\"]}";
-
-    std_msgs::msg::String msg;
-    msg.data = oss.str();
-    mail_pub_->publish(msg);
-    RCLCPP_INFO(get_logger(), "Published mail request for waypoint '%s'", waypoint_name.c_str());
+    send_mail(mail_subject_ + " - " + waypoint_name, {image_path});
   }
 
   void transition(State s)
@@ -511,6 +645,11 @@ private:
   double stall_timeout_sec_{6.0};
   double stall_cmd_vel_threshold_{0.03};
   double stall_vel_raw_threshold_{0.02};
+  std::string detections_topic_;
+  bool cat_recognized_mail_enabled_{true};
+  double cat_recognized_min_conf_{0.6};
+  double cat_recognized_cooldown_sec_{30.0};
+  bool loop_boundary_mail_enabled_{true};
 
   // State
   State state_{State::SLEEPING};
@@ -520,6 +659,8 @@ private:
   std::vector<std::string> cycle_image_paths_;
   std::optional<rclcpp::Time> stall_since_;
   GoalHandle::SharedPtr active_goal_handle_;
+  // label ("white"/"brown") -> time of last cat-recognized email (cooldown).
+  std::unordered_map<std::string, rclcpp::Time> last_cat_mail_;
 
   // Concurrency
   rclcpp::CallbackGroup::SharedPtr fsm_group_;
@@ -530,6 +671,7 @@ private:
   rclcpp::TimerBase::SharedPtr wake_timer_;
   rclcpp::TimerBase::SharedPtr pause_timer_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr detections_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr vel_raw_sub_;
   geometry_msgs::msg::Twist::SharedPtr last_cmd_vel_;

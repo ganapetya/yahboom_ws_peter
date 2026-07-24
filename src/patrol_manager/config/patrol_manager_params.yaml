@@ -35,6 +35,17 @@ patrol_manager:
     mail_subject: "Cat patrol photos"
     smtp_to_address: "peter.botnet@gmail.com"
 
+    # --- Extra snapshot emails (all reuse mail_subject above as a prefix) ---
+    # One snapshot at the START (WAKING) and END (returned home) of every cycle.
+    loop_boundary_mail_enabled: true
+    # One snapshot when cat_detector_cpp recognizes a white/brown cat during a
+    # cycle (reads the identity from results[1] on detections_topic). The
+    # per-waypoint capture email is unaffected.
+    detections_topic: "/cat_detector_cpp/detections"
+    cat_recognized_mail_enabled: true
+    cat_recognized_min_conf: 0.6       # Identity confidence bar before emailing
+    cat_recognized_cooldown_sec: 30.0  # Min seconds between emails for the SAME cat
+
     # --- Frame assumptions ---
     map_frame: "map"
 
