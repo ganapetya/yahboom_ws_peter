@@ -16,6 +16,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "sensor_msgs/msg/image.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "vision_msgs/msg/detection2_d_array.hpp"
 #include "visualization_msgs/msg/marker.hpp"
@@ -72,6 +73,19 @@ public:
       declare_parameter<double>("cat_recognized_cooldown_sec", 30.0);
     // --- Loop-boundary snapshot emails (start of WAKING, end at home) ---
     loop_boundary_mail_enabled_ = declare_parameter<bool>("loop_boundary_mail_enabled", true);
+
+    // --- Audio readiness gate (Bluetooth A2DP end-to-end probe) ---
+    // When true, WAKING will not send the first nav goal until
+    // /cat_patrol/audio_ready latches true (published by cat_voice after a
+    // successful ready-chime play through the BT sink). Fail-closed: on
+    // timeout we return to SLEEPING and do not drive. Disabled when voice is
+    // off (patrol_system passes require_audio_ready:=false with use_voice:=false).
+    require_audio_ready_ = declare_parameter<bool>("require_audio_ready", false);
+    audio_ready_topic_ = declare_parameter<std::string>(
+      "audio_ready_topic", "/cat_patrol/audio_ready");
+    audio_ready_timeout_sec_ = declare_parameter<double>("audio_ready_timeout_sec", 90.0);
+    audio_ready_ = !require_audio_ready_;
+    audio_ready_deadline_set_ = false;
 
     // Stall guard: compares commanded velocity (cmd_vel_topic) against actual
     // wheel-encoder velocity (vel_raw_topic). Nav2's own progress checker only
@@ -151,6 +165,24 @@ public:
         det_opts);
     }
 
+    // Latched audio-ready from cat_voice (transient_local). Same fsm_group so
+    // the flag is only mutated serialized with tick().
+    if (require_audio_ready_) {
+      rclcpp::SubscriptionOptions audio_opts;
+      audio_opts.callback_group = fsm_group_;
+      audio_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
+        audio_ready_topic_,
+        rclcpp::QoS(1).transient_local().reliable(),
+        [this](std_msgs::msg::Bool::SharedPtr msg) {
+          if (msg->data && !audio_ready_) {
+            audio_ready_ = true;
+            RCLCPP_INFO(get_logger(), "Audio ready received on %s — navigation unlocked",
+                        audio_ready_topic_.c_str());
+          }
+        },
+        audio_opts);
+    }
+
     mail_pub_ = create_publisher<std_msgs::msg::String>(mail_request_topic_, 10);
     state_pub_ = create_publisher<std_msgs::msg::String>(state_topic_, 10);
 
@@ -170,8 +202,12 @@ public:
     state_ = start_on_boot_ ? State::WAKING : State::SLEEPING;
     publish_state();
 
-    RCLCPP_INFO(get_logger(), "PatrolManager started. strategy=%s waypoints=%zu",
-                strategy_->name().c_str(), names.size());
+    RCLCPP_INFO(get_logger(),
+                "PatrolManager started. strategy=%s waypoints=%zu "
+                "require_audio_ready=%s audio_ready_timeout=%.0fs",
+                strategy_->name().c_str(), names.size(),
+                require_audio_ready_ ? "true" : "false",
+                audio_ready_timeout_sec_);
   }
 
 private:
@@ -253,15 +289,39 @@ private:
       case State::WAKING:
         cycle_image_paths_.clear();
         strategy_->reset();
-        // Non-blocking readiness check — never block inside the FSM timer (see §9).
-        // Stay in WAKING and re-check next tick until the server is up.
+
+        // 1) Audio gate (BT ready-chime). Fail-closed on timeout → SLEEPING.
+        //    Latched audio_ready_ stays true across later loops in this process.
+        if (require_audio_ready_ && !audio_ready_) {
+          if (!audio_ready_deadline_set_) {
+            audio_ready_deadline_ = now() + rclcpp::Duration::from_seconds(audio_ready_timeout_sec_);
+            audio_ready_deadline_set_ = true;
+            RCLCPP_INFO(get_logger(),
+              "WAKING: waiting for audio ready on %s (timeout %.0fs)",
+              audio_ready_topic_.c_str(), audio_ready_timeout_sec_);
+          }
+          if (now() > audio_ready_deadline_) {
+            RCLCPP_ERROR(get_logger(),
+              "Audio ready timed out after %.0fs on %s — staying home (fail-closed). "
+              "Check BT speaker, connect_bt_speaker, cat_voice ready probe.",
+              audio_ready_timeout_sec_, audio_ready_topic_.c_str());
+            audio_ready_deadline_set_ = false;
+            transition(State::SLEEPING);
+            break;
+          }
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000,
+            "audio not ready yet; staying in WAKING (no drive)");
+          break;
+        }
+
+        // 2) Non-blocking Nav2 readiness — never block inside the FSM timer.
         if (!action_client_->action_server_is_ready()) {
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
             "navigate_to_pose action server unavailable; staying in WAKING");
           break;
         }
         // Loop START email: one snapshot as a new cycle begins. We only reach
-        // here (server ready) once per cycle before leaving WAKING for
+        // here (server + audio ready) once per cycle before leaving WAKING for
         // PATROLLING, so this fires exactly once per loop.
         if (loop_boundary_mail_enabled_) {
           const std::string p = save_snapshot("loopstart");
@@ -483,8 +543,10 @@ private:
   bool is_patrolling() const { return state_ != State::SLEEPING; }
 
   // Emails one snapshot when cat_detector_cpp recognizes a white/brown cat
-  // mid-cycle. Mirrors voice_node.py's identity logic (results[1]); highest-
-  // confidence identity in the frame, gated by min-conf and a per-cat cooldown.
+  // mid-cycle. Highest-confidence identity in the frame, gated by min-conf and
+  // a GLOBAL any-cat cooldown (not only per-label). Per-label-only cooldown
+  // used to allow white+brown double-emails when the classifier flip-flopped
+  // within ~250ms on one physical cat.
   void detections_cb(const vision_msgs::msg::Detection2DArray::SharedPtr msg)
   {
     if (!cat_recognized_mail_enabled_ || !is_patrolling()) {
@@ -511,6 +573,11 @@ private:
     }
 
     const rclcpp::Time tnow = now();
+    if (last_cat_mail_any_.has_value() &&
+        (tnow - *last_cat_mail_any_).seconds() < cat_recognized_cooldown_sec_)
+    {
+      return;  // any-cat cooldown (blocks white→brown flip doubles)
+    }
     const auto it = last_cat_mail_.find(best_label);
     if (it != last_cat_mail_.end() &&
         (tnow - it->second).seconds() < cat_recognized_cooldown_sec_)
@@ -523,6 +590,7 @@ private:
       return;  // no frame yet; try again on the next detection
     }
     last_cat_mail_[best_label] = tnow;
+    last_cat_mail_any_ = tnow;
     RCLCPP_INFO(get_logger(), "Recognized %s cat (%.2f) - emailing snapshot",
                 best_label.c_str(), best_conf);
     send_mail(mail_subject_ + " - " + best_label + " cat recognized", {path});
@@ -650,6 +718,12 @@ private:
   double cat_recognized_min_conf_{0.6};
   double cat_recognized_cooldown_sec_{30.0};
   bool loop_boundary_mail_enabled_{true};
+  bool require_audio_ready_{false};
+  std::string audio_ready_topic_;
+  double audio_ready_timeout_sec_{90.0};
+  bool audio_ready_{true};
+  bool audio_ready_deadline_set_{false};
+  rclcpp::Time audio_ready_deadline_{0, 0, RCL_ROS_TIME};
 
   // State
   State state_{State::SLEEPING};
@@ -661,6 +735,8 @@ private:
   GoalHandle::SharedPtr active_goal_handle_;
   // label ("white"/"brown") -> time of last cat-recognized email (cooldown).
   std::unordered_map<std::string, rclcpp::Time> last_cat_mail_;
+  // Any-cat cooldown (blocks back-to-back white then brown on one sighting).
+  std::optional<rclcpp::Time> last_cat_mail_any_;
 
   // Concurrency
   rclcpp::CallbackGroup::SharedPtr fsm_group_;
@@ -674,6 +750,7 @@ private:
   rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr detections_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr vel_raw_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr audio_ready_sub_;
   geometry_msgs::msg::Twist::SharedPtr last_cmd_vel_;
   geometry_msgs::msg::Twist::SharedPtr last_vel_raw_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr mail_pub_;

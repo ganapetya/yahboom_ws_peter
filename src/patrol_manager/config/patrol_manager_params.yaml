@@ -6,6 +6,15 @@ patrol_manager:
     patrol_period_sec: 1800.0
     patrol_pause_sec: 10.0
 
+    # --- Audio readiness (Bluetooth) ---
+    # When true, WAKING will not drive until /cat_patrol/audio_ready latches true
+    # (cat_voice after ready-chime through BT). Fail-closed on timeout → SLEEPING.
+    # patrol_system.launch.py sets this true when use_voice:=true; leave false
+    # for silent / no-BT runs so the brain is not stuck forever.
+    require_audio_ready: false
+    audio_ready_topic: "/cat_patrol/audio_ready"
+    audio_ready_timeout_sec: 90.0
+
     # --- Navigation action ---
     navigate_action_name: "navigate_to_pose"
     nav_goal_timeout_sec: 180.0

@@ -8,7 +8,10 @@ cat_detector_cpp:
     # --- Class filtering ---
     # COCO 'cat' == class 15.
     target_classes: [15]
-    conf_threshold: 0.45
+    # Raised 0.45 → 0.58 (2026-07-24): empty-room FPs on slippers/shoes/walls
+    # were firing sightings and often locking as "white" (jente). If real cats
+    # at distance drop out, try 0.52–0.55 before going lower.
+    conf_threshold: 0.58
     iou_threshold: 0.50
 
     # --- Topics ---
@@ -43,3 +46,25 @@ cat_detector_cpp:
     # Must match the class index order printed by export_classifier_onnx.py
     # (alphabetical, same as train_classifier.py's CLASSES).
     classifier_classes: ["brown", "white"]
+
+    # Temporal lock + asymmetric floors (2026-07-24):
+    # - White needs a high bar: MobileNet + white walls → false "white"/jente.
+    # - Brown allowed lower: dark fur in dim rooms often softens softmax.
+    # - More stable frames cut one-shot flip-flops that steal voice cooldown.
+    id_min_conf: 0.70
+    id_min_conf_white: 0.80
+    id_min_conf_brown: 0.55
+    id_stable_frames: 3
+    id_switch_margin: 0.15
+
+    # --- ID crop / ambiguity ---
+    # Near-white pixel veto MUST stay off: white fur looks like white walls.
+    id_pad_frac: 0.08
+    id_box_shrink: 0.90
+    id_min_margin: 0.15
+    # Slightly larger min box: tiny edge blobs + shoe fragments are unreliable.
+    id_min_box_area_px: 2800
+    # Veto "white" only if crop has lots of warm/brown fur (mis-ID brown cat).
+    id_white_veto_brown_frac: 0.22
+    # DISABLED (>1.0). Do not re-enable without a texture/depth check first.
+    id_white_veto_bg_frac: 1.01
